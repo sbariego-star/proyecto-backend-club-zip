@@ -1,0 +1,100 @@
+from datetime import datetime, date, time, timedelta
+import re
+
+FORMATO_FECHA_HORA = "%Y-%m-%dT%H:%M:%S.%f-03:00"
+REGEX_FECHA_HORA = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}-03:00$"
+)
+
+
+def error(message, code="BAD_REQUEST", status=400):
+    return {
+        "errors": [{
+            "code": code,
+            "message": message,
+            "level": "error",
+            "description": message
+        }]
+    }, status
+
+
+def validar_id(valor):
+    try:
+        numero = int(valor)
+        return numero > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def validar_booleano(valor):
+    return valor in ("true", "false")
+
+
+def booleano(valor):
+    return valor == "true"
+
+
+def validar_paginacion(args):
+    try:
+        limite = int(args.get("_limit", 10))
+        offset = int(args.get("_offset", 0))
+    except ValueError:
+        return None, None
+
+    if limite < 1 or limite > 100 or offset < 0:
+        return None, None
+
+    return limite, offset
+
+
+def parsear_fecha_hora(valor):
+    if not isinstance(valor, str) or not REGEX_FECHA_HORA.match(valor):
+        raise ValueError(
+            "La fecha_hora debe tener formato YYYY-MM-DDTHH:MM:SS.ffffff-03:00"
+        )
+
+    return datetime.strptime(valor, FORMATO_FECHA_HORA)
+
+
+def validar_intervalo(inicio, fin, exigir_futuro=True):
+    ahora = datetime.now()
+
+    if inicio >= fin:
+        return "fecha_hora_inicio debe ser anterior a fecha_hora_fin"
+
+    if exigir_futuro and inicio <= ahora:
+        return "La reserva debe comenzar despuÃ©s del momento actual"
+
+    if inicio.date() != fin.date():
+        return "La reserva no puede cruzar la medianoche"
+
+    apertura = time(8, 0)
+    cierre = time(23, 0)
+
+    if inicio.time() < apertura or fin.time() > cierre:
+        return "La reserva debe estar dentro del horario 08:00 a 23:00"
+
+    if inicio.minute != 0 or inicio.second != 0 or inicio.microsecond != 0:
+        return "La hora de inicio debe ser exacta, sin minutos ni segundos"
+
+    if fin.minute != 0 or fin.second != 0 or fin.microsecond != 0:
+        return "La hora de fin debe ser exacta, sin minutos ni segundos"
+
+    horas = int((fin - inicio).total_seconds() / 3600)
+
+    if horas < 1 or horas > 3:
+        return "La reserva debe durar entre 1 y 3 horas"
+
+    return None
+
+
+def fecha_desde_string(valor):
+    try:
+        return date.fromisoformat(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def ahora_con_formato():
+    ahora = datetime.now()
+    return ahora
