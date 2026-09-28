@@ -1,0 +1,214 @@
+from flask import Blueprint, jsonify, request
+from db import get_db
+from validators import error, validar_paginacion
+
+socios_bp = Blueprint("socios", __name__)
+
+
+def socio_dict(fila):
+    return {
+        "id": fila["id"],
+        "nombre": fila["nombre"],
+        "email": fila["email"],
+        "activo": bool(fila["activo"])
+    }
+
+
+def links(limit, offset, total):
+    ultimo = max(0, ((max(total - 1, 0)) // limit) * limit)
+    result = {
+        "_first": {"href": f"/socios?_limit={limit}&_offset=0"},
+        "_last": {"href": f"/socios?_limit={limit}&_offset={ultimo}"}
+    }
+    if offset >= limit:
+        result["_prev"] = {
+            "href": f"/socios?_limit={limit}&_offset={offset-limit}"
+        }
+    if offset + limit < total:
+        result["_next"] = {
+            "href": f"/socios?_limit={limit}&_offset={offset+limit}"
+        }
+    return result
+
+
+@socios_bp.get("/socios")
+def listar_socios():
+    limite, offset = validar_paginacion(request.args)
+    if limite is None:
+        return error("ParÃ¡metros de paginaciÃ³n invÃ¡lidos")
+
+    query = "SELECT * FROM socios WHERE 1=1"
+    count_query = "SELECT COUNT(*) AS total FROM socios WHERE 1=1"
+    params = []
+    count_params = []
+
+    if "nombre" in request.args:
+        valor = request.args["nombre"]
+        query += " AND LOWER(nombre) LIKE LOWER(?)"
+        count_query += " AND LOWER(nombre) LIKE LOWER(?)"
+        params.append(f"%{valor}%")
+        count_params.append(f"%{valor}%")
+
+    if "activo" in request.args:
+        if request.args["activo"] not in ("true", "false"):
+            return error("activo debe ser true o false")
+        valor = 1 if request.args["activo"] == "true" else 0
+        query += " AND activo = ?"
+        count_query += " AND activo = ?"
+        params.append(valor)
+        count_params.append(valor)
+
+    query += " ORDER BY id ASC LIMIT ? OFFSET ?"
+    params.extend([limite, offset])
+
+    db = get_db()
+    filas = db.execute(query, params).fetchall()
+    total = db.execute(count_query, count_params).fetchone()["total"]
+    db.close()
+
+    return jsonify({
+        "socios": [socio_dict(f) for f in filas],
+        "_links": links(limite, offset, total)
+    }), 200
+
+
+@socios_bp.post("/socios")
+def crear_socio():
+    datos = request.get_json(silent=True)
+
+    if not isinstance(datos, dict):
+        return error("El cuerpo debe ser un objeto JSON")
+
+    if set(datos) - {"nombre", "email"}:
+        return error("El cuerpo contiene campos desconocidos")
+
+    if "nombre" not in datos or "email" not in datos:
+        return error("nombre y email son obligatorios")
+
+    nombre = datos["nombre"]
+    email = datos["email"]
+
+    if not isinstance(nombre, str) or not nombre.strip():
+        return error("nombre no puede estar vacÃ­o")
+
+    if not isinstance(email, str):
+        return error("email debe ser vÃ¡lido")
+
+    email = email.strip().lower()
+    nombre = nombre.strip()
+
+    if "@" not in email or "." not in email.split("@")[-1]:
+        return error("email debe tener formato vÃ¡lido")
+
+    db = get_db()
+
+    existe = db.execute(
+        "SELECT id FROM socios WHERE email = ?", (email,)
+    ).fetchone()
+
+    if existe is not None:
+        db.close()
+        return error(
+            "Ya existe un socio con ese email",
+            "CONFLICT",
+            409
+        )
+
+    cursor = db.execute(
+        "INSERT INTO socios(nombre, email, activo) VALUES (?, ?, 1)",
+        (nombre, email)
+    )
+    nuevo_id = cursor.lastrowid
+    db.commit()
+
+    fila = db.execute(
+        "SELECT * FROM socios WHERE id = ?", (nuevo_id,)
+    ).fetchone()
+    db.close()
+
+    return jsonify(socio_dict(fila)), 201
+
+
+@socios_bp.get("/socios/<int:id>")
+def obtener_socio(id):
+    db = get_db()
+    fila = db.execute(
+        "SELECT * FROM socios WHERE id = ?", (id,)
+    ).fetchone()
+    db.close()
+
+    if fila is None:
+        return error("El socio no existe", "NOT_FOUND", 404)
+
+    return jsonify(socio_dict(fila)), 200
+
+
+@socios_bp.patch("/socios/<int:id>")
+def modificar_socio(id):
+    datos = request.get_json(silent=True)
+
+    if not isinstance(datos, dict):
+        return error("El cuerpo debe ser un objeto JSON")
+
+    permitidos = {"nombre", "email", "activo"}
+    if set(datos) - permitidos:
+        return error("El cuerpo contiene campos desconocidos")
+    if not datos:
+        return error("El cuerpo no puede estar vacÃ­o")
+
+    db = get_db()
+    fila = db.execute(
+        "SELECT * FROM socios WHERE id = ?", (id,)
+    ).fetchone()
+
+    if fila is None:
+        db.close()
+        return error("El socio no existe", "NOT_FOUND", 404)
+
+    nombre = fila["nombre"]
+    email = fila["email"]
+    activo = fila["activo"]
+
+    if "nombre" in datos:
+        if not isinstance(datos["nombre"], str) or not datos["nombre"].strip():
+            db.close()
+            return error("nombre no puede estar vacÃ­o")
+        nombre = datos["nombre"].strip()
+
+    if "email" in datos:
+        if not isinstance(datos["email"], str):
+            db.close()
+            return error("email debe ser vÃ¡lido")
+        email = datos["email"].strip().lower()
+        if "@" not in email or "." not in email.split("@")[-1]:
+            db.close()
+            return error("email debe tener formato vÃ¡lido")
+
+        otro = db.execute(
+            "SELECT id FROM socios WHERE email = ? AND id <> ?",
+            (email, id)
+        ).fetchone()
+        if otro is not None:
+            db.close()
+            return error(
+                "Ya existe un socio con ese email",
+                "CONFLICT",
+                409
+            )
+
+    if "activo" in datos:
+        if not isinstance(datos["activo"], bool):
+            db.close()
+            return error("activo debe ser booleano")
+        activo = int(datos["activo"])
+
+    db.execute("""
+        UPDATE socios
+        SET nombre = ?, email = ?, activo = ?
+        WHERE id = ?
+    """, (nombre, email, activo, id))
+
+    db.commit()
+    db.close()
+
+    return "", 204
