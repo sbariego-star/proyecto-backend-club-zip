@@ -1,0 +1,17 @@
+from flask import Blueprint, jsonify
+from db import get_db
+
+deportes_bp = Blueprint("deportes", __name__)
+
+
+@deportes_bp.get("/deportes")
+def listar_deportes():
+    db = get_db()
+    filas = db.execute(
+        "SELECT id, nombre FROM deportes ORDER BY id ASC"
+    ).fetchall()
+    db.close()
+
+    return jsonify({
+        "deportes": [dict(fila) for fila in filas]
+    }), 200
