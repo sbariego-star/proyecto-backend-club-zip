@@ -1,0 +1,23 @@
+import sqlite3
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "club.db"
+SQL_PATH = BASE_DIR / "init_db.sql"
+
+
+def get_db():
+    conexion = sqlite3.connect(DB_PATH)
+    conexion.row_factory = sqlite3.Row
+    conexion.execute("PRAGMA foreign_keys = ON")
+    return conexion
+
+
+def init_db():
+    conexion = get_db()
+
+    with open(SQL_PATH, "r", encoding="utf-8") as archivo:
+        conexion.executescript(archivo.read())
+
+    conexion.commit()
+    conexion.close()
