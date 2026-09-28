@@ -1,0 +1,379 @@
+from flask import Blueprint, jsonify, request
+from db import get_db
+from validators import (
+    error, validar_id, validar_booleano, booleano,
+    validar_paginacion
+)
+
+canchas_bp = Blueprint("canchas", __name__)
+
+
+def cancha_dict(fila):
+    return {
+        "id": fila["id"],
+        "nombre": fila["nombre"],
+        "id_deporte": fila["id_deporte"],
+        "precio_hora": fila["precio_hora"],
+        "techada": bool(fila["techada"]),
+        "activa": bool(fila["activa"])
+    }
+
+
+def links(path, limit, offset, total):
+    ultimo = max(0, ((max(total - 1, 0)) // limit) * limit)
+
+    result = {
+        "_first": {"href": f"{path}?_limit={limit}&_offset=0"},
+        "_last": {"href": f"{path}?_limit={limit}&_offset={ultimo}"}
+    }
+
+    if offset >= limit:
+        result["_prev"] = {
+            "href": f"{path}?_limit={limit}&_offset={offset-limit}"
+        }
+
+    if offset + limit < total:
+        result["_next"] = {
+            "href": f"{path}?_limit={limit}&_offset={offset+limit}"
+        }
+
+    return result
+
+
+@canchas_bp.get("/canchas")
+def listar_canchas():
+    limite, offset = validar_paginacion(request.args)
+    if limite is None:
+        return error("ParÃ¡metros de paginaciÃ³n invÃ¡lidos")
+
+    query = """
+        SELECT id, nombre, id_deporte, precio_hora, techada, activa
+        FROM canchas
+        WHERE 1 = 1
+    """
+    count_query = "SELECT COUNT(*) AS total FROM canchas WHERE 1 = 1"
+    params = []
+    count_params = []
+
+    if "id_deporte" in request.args:
+        if not validar_id(request.args["id_deporte"]):
+            return error("id_deporte debe ser un entero positivo")
+        query += " AND id_deporte = ?"
+        count_query += " AND id_deporte = ?"
+        params.append(int(request.args["id_deporte"]))
+        count_params.append(int(request.args["id_deporte"]))
+
+    if "nombre" in request.args:
+        nombre = request.args["nombre"]
+        query += " AND LOWER(nombre) LIKE LOWER(?)"
+        count_query += " AND LOWER(nombre) LIKE LOWER(?)"
+        params.append(f"%{nombre}%")
+        count_params.append(f"%{nombre}%")
+
+    for campo in ("techada", "activa"):
+        if campo in request.args:
+            if not validar_booleano(request.args[campo]):
+                return error(f"{campo} debe ser true o false")
+            valor = 1 if booleano(request.args[campo]) else 0
+            query += f" AND {campo} = ?"
+            count_query += f" AND {campo} = ?"
+            params.append(valor)
+            count_params.append(valor)
+
+    query += " ORDER BY id ASC LIMIT ? OFFSET ?"
+    params.extend([limite, offset])
+
+    db = get_db()
+    filas = db.execute(query, params).fetchall()
+    total = db.execute(count_query, count_params).fetchone()["total"]
+    db.close()
+
+    resultado = {
+        "canchas": [cancha_dict(f) for f in filas],
+        "_links": links("/canchas", limite, offset, total)
+    }
+    return jsonify(resultado), 200
+
+
+@canchas_bp.post("/canchas")
+def crear_cancha():
+    datos = request.get_json(silent=True)
+
+    if not isinstance(datos, dict):
+        return error("El cuerpo debe ser un objeto JSON")
+
+    permitidos = {"nombre", "id_deporte", "precio_hora", "techada", "activa"}
+    desconocidos = set(datos) - permitidos
+    if desconocidos:
+        return error("El cuerpo contiene campos desconocidos")
+
+    for campo in ("nombre", "id_deporte", "precio_hora"):
+        if campo not in datos:
+            return error(f"Falta el campo obligatorio: {campo}")
+
+    nombre = datos["nombre"]
+    if not isinstance(nombre, str) or not nombre.strip():
+        return error("nombre no puede estar vacÃ­o")
+    nombre = nombre.strip()
+
+    if not validar_id(datos["id_deporte"]):
+        return error("id_deporte debe ser un entero positivo")
+
+    if not isinstance(datos["precio_hora"], int) or isinstance(datos["precio_hora"], bool):
+        return error("precio_hora debe ser un entero")
+    if datos["precio_hora"] <= 0:
+        return error("precio_hora debe ser mayor que 0")
+
+    techada = datos.get("techada", False)
+    activa = datos.get("activa", True)
+
+    if not isinstance(techada, bool) or not isinstance(activa, bool):
+        return error("techada y activa deben ser booleanos")
+
+    db = get_db()
+
+    deporte = db.execute(
+        "SELECT id FROM deportes WHERE id = ?",
+        (datos["id_deporte"],)
+    ).fetchone()
+
+    if deporte is None:
+        db.close()
+        return error("El deporte no existe", "NOT_FOUND", 404)
+
+    cursor = db.execute("""
+        INSERT INTO canchas(nombre, id_deporte, precio_hora, techada, activa)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        nombre,
+        datos["id_deporte"],
+        datos["precio_hora"],
+        int(techada),
+        int(activa)
+    ))
+
+    nuevo_id = cursor.lastrowid
+    db.commit()
+
+    fila = db.execute(
+        "SELECT * FROM canchas WHERE id = ?", (nuevo_id,)
+    ).fetchone()
+    db.close()
+
+    return jsonify(cancha_dict(fila)), 201
+
+
+@canchas_bp.get("/canchas/<int:id>")
+def obtener_cancha(id):
+    if id <= 0:
+        return error("El id debe ser positivo")
+
+    db = get_db()
+    fila = db.execute(
+        "SELECT * FROM canchas WHERE id = ?", (id,)
+    ).fetchone()
+    db.close()
+
+    if fila is None:
+        return error("La cancha no existe", "NOT_FOUND", 404)
+
+    return jsonify(cancha_dict(fila)), 200
+
+
+@canchas_bp.patch("/canchas/<int:id>")
+def modificar_cancha(id):
+    datos = request.get_json(silent=True)
+
+    if not isinstance(datos, dict):
+        return error("El cuerpo debe ser un objeto JSON")
+
+    permitidos = {"nombre", "precio_hora", "techada", "activa"}
+    if set(datos) - permitidos:
+        return error("El cuerpo contiene campos desconocidos")
+    if not datos:
+        return error("El cuerpo no puede estar vacÃ­o")
+
+    db = get_db()
+
+    fila = db.execute(
+        "SELECT * FROM canchas WHERE id = ?", (id,)
+    ).fetchone()
+
+    if fila is None:
+        db.close()
+        return error("La cancha no existe", "NOT_FOUND", 404)
+
+    valores = {
+        "nombre": fila["nombre"],
+        "precio_hora": fila["precio_hora"],
+        "techada": fila["techada"],
+        "activa": fila["activa"]
+    }
+
+    if "nombre" in datos:
+        if not isinstance(datos["nombre"], str) or not datos["nombre"].strip():
+            db.close()
+            return error("nombre no puede estar vacÃ­o")
+        valores["nombre"] = datos["nombre"].strip()
+
+    if "precio_hora" in datos:
+        if not isinstance(datos["precio_hora"], int) or isinstance(datos["precio_hora"], bool):
+            db.close()
+            return error("precio_hora debe ser un entero")
+        if datos["precio_hora"] <= 0:
+            db.close()
+            return error("precio_hora debe ser mayor que 0")
+        valores["precio_hora"] = datos["precio_hora"]
+
+    for campo in ("techada", "activa"):
+        if campo in datos:
+            if not isinstance(datos[campo], bool):
+                db.close()
+                return error(f"{campo} debe ser booleano")
+            valores[campo] = int(datos[campo])
+
+    db.execute("""
+        UPDATE canchas
+        SET nombre = ?, precio_hora = ?, techada = ?, activa = ?
+        WHERE id = ?
+    """, (
+        valores["nombre"],
+        valores["precio_hora"],
+        valores["techada"],
+        valores["activa"],
+        id
+    ))
+    db.commit()
+    db.close()
+
+    return "", 204
+
+
+@canchas_bp.delete("/canchas/<int:id>")
+def eliminar_cancha(id):
+    db = get_db()
+
+    fila = db.execute(
+        "SELECT id FROM canchas WHERE id = ?", (id,)
+    ).fetchone()
+
+    if fila is None:
+        db.close()
+        return error("La cancha no existe", "NOT_FOUND", 404)
+
+    reserva = db.execute(
+        "SELECT id FROM reservas WHERE id_cancha = ? LIMIT 1",
+        (id,)
+    ).fetchone()
+
+    if reserva is not None:
+        db.close()
+        return error(
+            "No se puede eliminar una cancha que tiene reservas",
+            "CONFLICT",
+            409
+        )
+
+    db.execute("DELETE FROM canchas WHERE id = ?", (id,))
+    db.commit()
+    db.close()
+
+    return "", 204
+
+
+@canchas_bp.get("/canchas/disponibles")
+def canchas_disponibles():
+    from datetime import datetime
+
+    limite, offset = validar_paginacion(request.args)
+    if limite is None:
+        return error("ParÃ¡metros de paginaciÃ³n invÃ¡lidos")
+
+    fecha = request.args.get("fecha")
+    hora_inicio = request.args.get("hora_inicio")
+    hora_fin = request.args.get("hora_fin")
+
+    if not fecha or not hora_inicio or not hora_fin:
+        return error("fecha, hora_inicio y hora_fin son obligatorios")
+
+    try:
+        datetime.strptime(fecha, "%Y-%m-%d")
+        inicio = datetime.strptime(
+            f"{fecha}T{hora_inicio}",
+            "%Y-%m-%dT%H:00:00"
+        )
+        fin = datetime.strptime(
+            f"{fecha}T{hora_fin}",
+            "%Y-%m-%dT%H:00:00"
+        )
+    except ValueError:
+        return error("fecha, hora_inicio y hora_fin tienen formato invÃ¡lido")
+
+    if inicio >= fin:
+        return error("hora_inicio debe ser anterior a hora_fin")
+
+    if inicio.hour < 8 or fin.hour > 23:
+        return error("El intervalo debe estar dentro de 08:00 a 23:00")
+
+    horas = int((fin - inicio).total_seconds() / 3600)
+    if horas < 1 or horas > 3:
+        return error("El intervalo debe durar entre 1 y 3 horas")
+
+    filtros = []
+    params = []
+
+    if "id_deporte" in request.args:
+        if not validar_id(request.args["id_deporte"]):
+            return error("id_deporte debe ser un entero positivo")
+        filtros.append("c.id_deporte = ?")
+        params.append(int(request.args["id_deporte"]))
+
+    if "techada" in request.args:
+        if not validar_booleano(request.args["techada"]):
+            return error("techada debe ser true o false")
+        filtros.append("c.techada = ?")
+        params.append(int(booleano(request.args["techada"])))
+
+    where_extra = ""
+    if filtros:
+        where_extra = " AND " + " AND ".join(filtros)
+
+    params.extend([f"{fecha} {hora_inicio}", f"{fecha} {hora_fin}"])
+
+    query = f"""
+        SELECT c.*
+        FROM canchas c
+        WHERE c.activa = 1
+        {where_extra}
+        AND NOT EXISTS (
+            SELECT 1
+            FROM reservas r
+            WHERE r.id_cancha = c.id
+              AND r.estado = 'confirmada'
+              AND r.fecha_hora_inicio < ?
+              AND r.fecha_hora_fin > ?
+        )
+        ORDER BY c.id ASC
+        LIMIT ? OFFSET ?
+    """
+
+    # Para la consulta de solapamiento se necesitan fin y comienzo.
+    params = params[:-2] + [
+        f"{fecha} {hora_fin}",
+        f"{fecha} {hora_inicio}",
+        limite,
+        offset
+    ]
+
+    db = get_db()
+    filas = db.execute(query, params).fetchall()
+    db.close()
+
+    return jsonify({
+        "canchas": [cancha_dict(f) for f in filas],
+        "_links": {
+            "_first": {
+                "href": f"/canchas/disponibles?fecha={fecha}&hora_inicio={hora_inicio}&hora_fin={hora_fin}&_limit={limite}&_offset=0"
+            }
+        }
+    }), 200
