@@ -1,0 +1,339 @@
+from flask import Blueprint, jsonify, request
+from datetime import datetime, date
+from db import get_db
+from validators import (
+    error, validar_paginacion, validar_id,
+    parsear_fecha_hora, validar_intervalo
+)
+
+reservas_bp = Blueprint("reservas", __name__)
+
+ESTADOS = {"confirmada", "cancelada", "finalizada"}
+
+
+def reserva_dict(fila):
+    return {
+        "id": fila["id"],
+        "id_socio": fila["id_socio"],
+        "id_cancha": fila["id_cancha"],
+        "fecha_hora_inicio": fila["fecha_hora_inicio"],
+        "fecha_hora_fin": fila["fecha_hora_fin"],
+        "estado": fila["estado"],
+        "precio_hora": fila["precio_hora"],
+        "precio_total": fila["precio_total"]
+    }
+
+
+def links(limit, offset, total):
+    ultimo = max(0, ((max(total - 1, 0)) // limit) * limit)
+    result = {
+        "_first": {"href": f"/reservas?_limit={limit}&_offset=0"},
+        "_last": {"href": f"/reservas?_limit={limit}&_offset={ultimo}"}
+    }
+    if offset >= limit:
+        result["_prev"] = {
+            "href": f"/reservas?_limit={limit}&_offset={offset-limit}"
+        }
+    if offset + limit < total:
+        result["_next"] = {
+            "href": f"/reservas?_limit={limit}&_offset={offset+limit}"
+        }
+    return result
+
+
+@reservas_bp.get("/reservas")
+def listar_reservas():
+    limite, offset = validar_paginacion(request.args)
+    if limite is None:
+        return error("ParÃ¡metros de paginaciÃ³n invÃ¡lidos")
+
+    query = "SELECT * FROM reservas WHERE 1=1"
+    count_query = "SELECT COUNT(*) AS total FROM reservas WHERE 1=1"
+    params = []
+    count_params = []
+
+    for campo in ("id_cancha", "id_socio"):
+        if campo in request.args:
+            if not validar_id(request.args[campo]):
+                return error(f"{campo} debe ser positivo")
+            query += f" AND {campo} = ?"
+            count_query += f" AND {campo} = ?"
+            valor = int(request.args[campo])
+            params.append(valor)
+            count_params.append(valor)
+
+    if "estado" in request.args:
+        if request.args["estado"] not in ESTADOS:
+            return error("estado invÃ¡lido")
+        query += " AND estado = ?"
+        count_query += " AND estado = ?"
+        params.append(request.args["estado"])
+        count_params.append(request.args["estado"])
+
+    desde = request.args.get("fecha_desde")
+    hasta = request.args.get("fecha_hasta")
+
+    if desde:
+        try:
+            date.fromisoformat(desde)
+        except ValueError:
+            return error("fecha_desde debe ser una fecha vÃ¡lida")
+        query += " AND DATE(fecha_hora_inicio) >= ?"
+        count_query += " AND DATE(fecha_hora_inicio) >= ?"
+        params.append(desde)
+        count_params.append(desde)
+
+    if hasta:
+        try:
+            date.fromisoformat(hasta)
+        except ValueError:
+            return error("fecha_hasta debe ser una fecha vÃ¡lida")
+        query += " AND DATE(fecha_hora_inicio) <= ?"
+        count_query += " AND DATE(fecha_hora_inicio) <= ?"
+        params.append(hasta)
+        count_params.append(hasta)
+
+    if desde and hasta and desde > hasta:
+        return error("fecha_desde debe ser menor o igual que fecha_hasta")
+
+    query += " ORDER BY id ASC LIMIT ? OFFSET ?"
+    params.extend([limite, offset])
+
+    db = get_db()
+    filas = db.execute(query, params).fetchall()
+    total = db.execute(count_query, count_params).fetchone()["total"]
+    db.close()
+
+    return jsonify({
+        "reservas": [reserva_dict(f) for f in filas],
+        "_links": links(limite, offset, total)
+    }), 200
+
+
+@reservas_bp.post("/reservas")
+def crear_reserva():
+    datos = request.get_json(silent=True)
+
+    if not isinstance(datos, dict):
+        return error("El cuerpo debe ser un objeto JSON")
+
+    permitidos = {
+        "id_socio",
+        "id_cancha",
+        "fecha_hora_inicio",
+        "fecha_hora_fin"
+    }
+
+    if set(datos) - permitidos:
+        return error("El cuerpo contiene campos desconocidos")
+
+    for campo in permitidos:
+        if campo not in datos:
+            return error(f"Falta el campo obligatorio: {campo}")
+
+    if not validar_id(datos["id_socio"]) or not validar_id(datos["id_cancha"]):
+        return error("id_socio e id_cancha deben ser positivos")
+
+    try:
+        inicio = parsear_fecha_hora(datos["fecha_hora_inicio"])
+        fin = parsear_fecha_hora(datos["fecha_hora_fin"])
+    except ValueError as exc:
+        return error(str(exc))
+
+    problema = validar_intervalo(inicio, fin, exigir_futuro=True)
+    if problema:
+        return error(problema)
+
+    inicio_db = inicio.strftime("%Y-%m-%dT%H:%M:%S.%f-03:00")
+    fin_db = fin.strftime("%Y-%m-%dT%H:%M:%S.%f-03:00")
+
+    db = get_db()
+
+    socio = db.execute(
+        "SELECT * FROM socios WHERE id = ?", (datos["id_socio"],)
+    ).fetchone()
+
+    if socio is None:
+        db.close()
+        return error("El socio no existe", "NOT_FOUND", 404)
+
+    if not socio["activo"]:
+        db.close()
+        return error("El socio estÃ¡ inactivo", "CONFLICT", 409)
+
+    cancha = db.execute(
+        "SELECT * FROM canchas WHERE id = ?", (datos["id_cancha"],)
+    ).fetchone()
+
+    if cancha is None:
+        db.close()
+        return error("La cancha no existe", "NOT_FOUND", 404)
+
+    if not cancha["activa"]:
+        db.close()
+        return error("La cancha estÃ¡ inactiva", "CONFLICT", 409)
+
+    # Solapamiento de la misma cancha.
+    conflicto_cancha = db.execute("""
+        SELECT id FROM reservas
+        WHERE id_cancha = ?
+          AND estado = 'confirmada'
+          AND fecha_hora_inicio < ?
+          AND fecha_hora_fin > ?
+        LIMIT 1
+    """, (
+        datos["id_cancha"],
+        fin_db,
+        inicio_db
+    )).fetchone()
+
+    if conflicto_cancha:
+        db.close()
+        return error(
+            "La cancha ya tiene una reserva superpuesta",
+            "CONFLICT",
+            409
+        )
+
+    # Solapamiento del mismo socio, aunque sea otra cancha.
+    conflicto_socio = db.execute("""
+        SELECT id FROM reservas
+        WHERE id_socio = ?
+          AND estado = 'confirmada'
+          AND fecha_hora_inicio < ?
+          AND fecha_hora_fin > ?
+        LIMIT 1
+    """, (
+        datos["id_socio"],
+        fin_db,
+        inicio_db
+    )).fetchone()
+
+    if conflicto_socio:
+        db.close()
+        return error(
+            "El socio ya tiene una reserva superpuesta",
+            "CONFLICT",
+            409
+        )
+
+    horas = int((fin - inicio).total_seconds() / 3600)
+    precio_hora = cancha["precio_hora"]
+    precio_total = horas * precio_hora
+
+    cursor = db.execute("""
+        INSERT INTO reservas(
+            id_socio, id_cancha, fecha_hora_inicio, fecha_hora_fin,
+            estado, precio_hora, precio_total
+        )
+        VALUES (?, ?, ?, ?, 'confirmada', ?, ?)
+    """, (
+        datos["id_socio"],
+        datos["id_cancha"],
+        inicio_db,
+        fin_db,
+        precio_hora,
+        precio_total
+    ))
+
+    nuevo_id = cursor.lastrowid
+    db.commit()
+
+    fila = db.execute(
+        "SELECT * FROM reservas WHERE id = ?", (nuevo_id,)
+    ).fetchone()
+
+    db.close()
+
+    return jsonify(reserva_dict(fila)), 201
+
+
+@reservas_bp.get("/reservas/<int:id>")
+def obtener_reserva(id):
+    db = get_db()
+    fila = db.execute(
+        "SELECT * FROM reservas WHERE id = ?", (id,)
+    ).fetchone()
+    db.close()
+
+    if fila is None:
+        return error("La reserva no existe", "NOT_FOUND", 404)
+
+    return jsonify(reserva_dict(fila)), 200
+
+
+@reservas_bp.put("/reservas/<int:id>/estado")
+def cambiar_estado(id):
+    datos = request.get_json(silent=True)
+
+    if not isinstance(datos, dict):
+        return error("El cuerpo debe ser un objeto JSON")
+
+    if set(datos) != {"estado"}:
+        return error("El cuerpo debe contener solamente estado")
+
+    nuevo_estado = datos["estado"]
+
+    if nuevo_estado not in ESTADOS:
+        return error("Estado invÃ¡lido")
+
+    db = get_db()
+    reserva = db.execute(
+        "SELECT * FROM reservas WHERE id = ?", (id,)
+    ).fetchone()
+
+    if reserva is None:
+        db.close()
+        return error("La reserva no existe", "NOT_FOUND", 404)
+
+    actual = reserva["estado"]
+
+    # Repetir el estado actual es Ã©xito sin modificar.
+    if actual == nuevo_estado:
+        db.close()
+        return "", 204
+
+    ahora = datetime.now()
+    inicio = datetime.strptime(
+        reserva["fecha_hora_inicio"],
+        "%Y-%m-%dT%H:%M:%S.%f-03:00"
+    )
+    fin = datetime.strptime(
+        reserva["fecha_hora_fin"],
+        "%Y-%m-%dT%H:%M:%S.%f-03:00"
+    )
+
+    if actual == "confirmada" and nuevo_estado == "cancelada":
+        if ahora >= inicio:
+            db.close()
+            return error(
+                "No se puede cancelar una reserva cuyo inicio ya llegÃ³",
+                "CONFLICT",
+                409
+            )
+
+    elif actual == "confirmada" and nuevo_estado == "finalizada":
+        if ahora < fin:
+            db.close()
+            return error(
+                "La reserva todavÃ­a no terminÃ³",
+                "CONFLICT",
+                409
+            )
+
+    else:
+        db.close()
+        return error(
+            "La transiciÃ³n de estado no estÃ¡ permitida",
+            "CONFLICT",
+            409
+        )
+
+    db.execute(
+        "UPDATE reservas SET estado = ? WHERE id = ?",
+        (nuevo_estado, id)
+    )
+    db.commit()
+    db.close()
+
+    return "", 204
